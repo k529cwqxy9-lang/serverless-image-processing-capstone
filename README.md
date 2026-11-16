@@ -1,30 +1,41 @@
 # Serverless Image Processing Capstone
 
-This project makes PNG thumbnails from JPEG and PNG images in S3. The Lambda uses Pillow to fit the image within 256 × 256 pixels without changing its aspect ratio.
+The Lambda reads JPEG and PNG images from a private S3 bucket and writes PNG thumbnails to a second bucket. It preserves the aspect ratio and fits the thumbnail within 256 × 256 pixels.
 
-- **Automatic:** Upload an image under `originals/` in the source bucket. S3 invokes the Lambda, which saves the thumbnail under `automatic/` in the output bucket.
-- **API:** Send an IAM-signed `POST /resize` request with the source object key. API Gateway starts Step Functions, which invokes the same Lambda. A Choice state sends the execution to success or failure. Successful API runs save a thumbnail under `workflow/`.
+- **Upload:** S3 upload → Lambda → thumbnail under `automatic/`.
+- **API request:** API Gateway → Step Functions → Lambda → thumbnail under `workflow/`. The Choice state routes the run to success or failure.
 
-```text
-S3 upload ────────────────→ Lambda → S3 thumbnails
-API Gateway → Step Functions ↗
-```
+## Run the demo
 
-## Deploy
+1. In the originals bucket, upload a JPEG as `originals/demo.jpg`. Open the thumbnails bucket and look for `automatic/demo.jpg.png`.
+2. Open AWS CloudShell in the same Region as the stack. Set `RESIZE_API_URL` to the `ResizeApiUrl` value from the CloudFormation stack outputs. Run the following using an AWS identity with permission to invoke the API. Change the signing Region if needed.
 
-You need AWS permissions for CloudFormation, IAM, S3, Lambda, Step Functions, and API Gateway, plus Python and PowerShell to build the packages. Use a same-Region private S3 bucket for the deployment files. Build the Pillow layer for Python 3.12 and Linux x86-64, then package the Lambda handler separately.
+   ```bash
+   export RESIZE_API_URL='YOUR_RESIZE_API_URL'
 
-```powershell
-python -m pip install --target layer/python --platform manylinux2014_x86_64 --implementation cp --python-version 3.12 --abi cp312 --only-binary=:all: Pillow==12.2.0
-Compress-Archive -Path layer/python -DestinationPath pillow-layer.zip
-Compress-Archive -Path lambda_function.py -DestinationPath resize-code.zip
-```
+   python3 - <<'PY'
+   import os
+   from urllib.request import Request, urlopen
+   import boto3
+   from botocore.auth import SigV4Auth
+   from botocore.awsrequest import AWSRequest
 
-Upload those two ZIPs and `state-machine.asl.json` to the root of the deployment bucket. In CloudFormation, create a stack with `template.json`, set the `AssetsBucket` parameter, and acknowledge IAM resource creation. The stack outputs show the originals bucket, thumbnails bucket, workflow ARN, and API URL.
+   url = os.environ["RESIZE_API_URL"]
+   body = b'{"key":"originals/demo.jpg"}'
+   credentials = boto3.Session().get_credentials().get_frozen_credentials()
+   request = AWSRequest(method="POST", url=url, data=body,
+                        headers={"Content-Type": "application/json"})
+   SigV4Auth(credentials, "execute-api", "us-east-1").add_auth(request)
+   with urlopen(Request(url, data=body, headers=dict(request.headers)),
+                timeout=20) as response:
+       print(response.read().decode())
+   PY
+   ```
 
-## Try it
+3. Open the returned execution in Step Functions. The success path ends at `ThumbnailCreated` and writes `workflow/demo.jpg.png`. Repeat the request with `originals/missing.jpg` to see the `ResizeFailed` path.
 
-1. Upload a JPEG as `originals/demo.jpg` in the originals bucket. Look for `automatic/demo.jpg.png` in the thumbnails bucket.
-2. From an authenticated AWS environment with Boto3 and permission to invoke the API, run `python3 invoke_api.py YOUR_API_URL originals/demo.jpg`. Use the `ResizeApiUrl` stack output. If you deployed outside N. Virginia, add `--region YOUR_REGION`.
-3. Open the returned execution in Step Functions and confirm it reached `ThumbnailCreated`. Look for `workflow/demo.jpg.png` in the thumbnails bucket.
-4. Repeat with `originals/missing.jpg` to see the `ResizeFailed` branch.
+## Deployment settings
+
+The Lambda uses Python 3.12, a Linux x86-64 Pillow layer, and the `lambda_function.lambda_handler` handler. Set its `ORIGINALS_BUCKET` and `THUMBNAILS_BUCKET` environment variables to the two bucket names. Configure the originals bucket to invoke the Lambda on object creation under `originals/`.
+
+In the state machine definition, substitute the Lambda ARN for `${ResizeFunctionArn}`. Give Step Functions permission to invoke that Lambda. Configure API Gateway’s IAM-authorized `POST /resize` route to start the state machine, passing the request body as execution input.
